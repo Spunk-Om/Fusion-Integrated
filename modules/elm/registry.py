@@ -17,6 +17,10 @@ NAV_ITEMS = [
      "to": "/elm/apply", "required_permission": "elm.leave.create", "sort_order": 20},
     {"code": "elm.review", "label": "Leave Review Queue", "icon": "FaClipboardCheck",
      "to": "/elm/review", "required_permission": "elm.leave.review", "sort_order": 30},
+    {"code": "elm.sanction", "label": "Leave Sanction Queue", "icon": "FaClipboardCheck",
+     "to": "/elm/review", "required_permission": "elm.leave.sanction", "sort_order": 40},
+    {"code": "elm.substitute", "label": "Substitute Responses", "icon": "FaClipboardCheck",
+     "to": "/elm/review", "required_permission": "elm.leave.substitute", "sort_order": 50},
     {"code": "elm.admin", "label": "ELM Administration", "icon": "FaCog",
      "to": "/elm/admin", "required_permission": "elm.leave.manage", "sort_order": 90},
 ]

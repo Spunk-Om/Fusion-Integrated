@@ -3,10 +3,8 @@ from decimal import Decimal
 
 from django.db import models
 from django.db.models import Q
-from django.utils import timezone
-
 from core.db.mixins import TimeStampedModel
-from modules.elm.domain.rules import DEFAULT_ENTITLEMENTS, SUPPORTED_CATEGORIES
+from modules.elm.domain.rules import SUPPORTED_CATEGORIES
 
 
 class LeavePolicy(TimeStampedModel):
@@ -116,9 +114,10 @@ class LeaveApplication(TimeStampedModel):
                      ("extension", "Extension"), ("resumption", "Resumption"),
                      ("offline", "Offline sanctioned leave")]
     STATUSES = [(s, s.replace("_", " ").title()) for s in (
-        "awaiting_substitute", "awaiting_unit_head", "awaiting_establishment",
-        "awaiting_sanction", "awaiting_resumption_review", "approved", "rejected",
-        "withdrawn", "cancelled", "action_required")]
+        "awaiting_substitute", "awaiting_unit_head", "awaiting_cancellation_unit_head",
+        "awaiting_establishment", "awaiting_sanction", "awaiting_cancellation_sanction",
+        "awaiting_resumption_review", "approved", "rejected", "withdrawn",
+        "cancelled", "action_required")]
     HALVES = [("none", "Full day"), ("first", "First half"), ("second", "Second half")]
     SUBSTITUTE_RESPONSES = [("not_required", "Not required"), ("pending", "Pending"),
                             ("accepted", "Accepted"), ("declined", "Declined")]
@@ -141,6 +140,7 @@ class LeaveApplication(TimeStampedModel):
     requires_substitute = models.BooleanField(default=False)
     substitute_user_id = models.IntegerField(null=True, blank=True)
     substitute_response = models.CharField(max_length=16, choices=SUBSTITUTE_RESPONSES, default="not_required")
+    director_case = models.BooleanField(default=False)
     status = models.CharField(max_length=36, choices=STATUSES, default="awaiting_unit_head", db_index=True)
     current_assignee_user_id = models.IntegerField(null=True, blank=True, db_index=True)
     unit_head_user_id = models.IntegerField(null=True, blank=True)
@@ -160,8 +160,15 @@ class LeaveApplication(TimeStampedModel):
         indexes = [models.Index(fields=["applicant_user_id", "status"], name="elm_app_user_status_idx"),
                    models.Index(fields=["current_assignee_user_id", "status"], name="elm_app_assign_status_idx"),
                    models.Index(fields=["start_date", "end_date"], name="elm_app_dates_idx")]
-        constraints = [models.CheckConstraint(condition=Q(end_date__gte=models.F("start_date")),
-                                               name="elm_app_dates_valid")]
+        constraints = [
+            models.CheckConstraint(condition=Q(end_date__gte=models.F("start_date")),
+                                   name="elm_app_dates_valid"),
+            models.UniqueConstraint(
+                fields=["evidence_reference"],
+                condition=Q(request_type="offline"),
+                name="elm_offline_evidence_uniq",
+            ),
+        ]
 
 
 class LeaveLedgerEntry(TimeStampedModel):

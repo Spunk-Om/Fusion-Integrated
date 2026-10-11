@@ -122,6 +122,22 @@
             "to": "/elm/review"
           },
           {
+            "code": "elm.sanction",
+            "icon": "FaClipboardCheck",
+            "label": "Leave Sanction Queue",
+            "required_permission": "elm.leave.sanction",
+            "sort_order": 40,
+            "to": "/elm/review"
+          },
+          {
+            "code": "elm.substitute",
+            "icon": "FaClipboardCheck",
+            "label": "Substitute Responses",
+            "required_permission": "elm.leave.substitute",
+            "sort_order": 50,
+            "to": "/elm/review"
+          },
+          {
             "code": "elm.admin",
             "icon": "FaCog",
             "label": "ELM Administration",

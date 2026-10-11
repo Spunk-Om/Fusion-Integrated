@@ -11,6 +11,7 @@ ACTIVE_REQUEST_STATUSES = frozenset({
     "awaiting_substitute", "awaiting_unit_head", "awaiting_establishment",
     "awaiting_sanction", "awaiting_cancellation_unit_head",
     "awaiting_cancellation_sanction", "awaiting_resumption_review",
+    "action_required",
 })
 
 DEFAULT_ENTITLEMENTS = {
@@ -42,13 +43,14 @@ def count_leave_days(
     end_date: date,
     closed_dates: set[date] | frozenset[date] = frozenset(),
     cl_half: str = "none",
+    continuous_counting: bool | None = None,
 ) -> Decimal:
     """Count leave days under the synchronized baseline.
 
-    EL/COL/VL are continuous calendar intervals. CL/SCL/RH exclude weekends
-    and dates identified as closed in the currently published calendar. CL can
-    be half-day on a single date; distinct first/second halves are tracked by
-    overlap validation in the service layer.
+    The continuous-calendar versus working-day counting mode can be supplied
+    from the active leave policy. CL half-days apply only to one open weekday;
+    RH is a one-day selection validated against the published holiday calendar.
+    Distinct first/second CL halves are handled by service-layer overlap checks.
     """
     if category not in SUPPORTED_CATEGORIES:
         raise ValueError(f"Unsupported leave category: {category}")
@@ -59,11 +61,23 @@ def count_leave_days(
     if cl_half != "none":
         if category != "CL" or start_date != end_date:
             raise ValueError("Half-day selection is valid only for one-date CL.")
+        if start_date.weekday() >= 5 or start_date in closed_dates:
+            return Decimal("0.00")
         return Decimal("0.50")
-    if category == "RH" and start_date != end_date:
-        raise ValueError("An RH request must cover one applicable restricted holiday.")
 
-    if category in CONTINUOUS_CATEGORIES:
+    if category == "RH":
+        if start_date != end_date:
+            raise ValueError("An RH request must cover one applicable restricted holiday.")
+        # Restricted holidays are selected explicitly from the calendar; they
+        # count as one unit even when the date is marked as a calendar closure.
+        return Decimal("1.00")
+
+    is_continuous = (
+        category in CONTINUOUS_CATEGORIES
+        if continuous_counting is None
+        else continuous_counting
+    )
+    if is_continuous:
         return Decimal((end_date - start_date).days + 1)
 
     count = 0

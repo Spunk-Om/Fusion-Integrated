@@ -5,7 +5,6 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Q
 from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
@@ -13,7 +12,7 @@ from fusion_auth.client import IamUnavailable
 from modules.directory import contracts as directory
 from modules.elm.domain.rules import (
     ACTIVE_REQUEST_STATUSES, CONTINUOUS_CATEGORIES, DEFAULT_ENTITLEMENTS,
-    SUPPORTED_CATEGORIES, count_leave_days, entitlement_for, ranges_overlap,
+    SUPPORTED_CATEGORIES, count_leave_days,
 )
 from modules.elm.models import (
     LeaveApplication, LeaveBalance, LeaveCalendar, LeaveCalendarDate,
@@ -22,8 +21,10 @@ from modules.elm.models import (
 )
 
 
-PENDING_STATUSES = tuple(ACTIVE_REQUEST_STATUSES)
-OVERLAP_STATUSES = (*PENDING_STATUSES, "approved")
+# "action_required" stays active for overlap/withdrawal checks, but is not an
+# assigned-review SLA task until it has been resubmitted/rerouted.
+PENDING_STATUSES = tuple(s for s in ACTIVE_REQUEST_STATUSES if s != "action_required")
+OVERLAP_STATUSES = (*ACTIVE_REQUEST_STATUSES, "approved")
 
 
 def _profile(actor):
@@ -46,13 +47,15 @@ def _policy(category: str) -> LeavePolicy:
     if policy is None:
         # Normally seeded by the initial migration; safe fallback for test DBs.
         kind = "faculty" if category == "VL" else "staff" if category == "EL" else "all"
-        policy = LeavePolicy.objects.create(
+        policy, _ = LeavePolicy.objects.get_or_create(
             category=category,
-            annual_entitlement=DEFAULT_ENTITLEMENTS[category],
-            employee_scope=kind,
-            carry_forward=category in {"EL", "COL"},
-            continuous_counting=category in CONTINUOUS_CATEGORIES,
-            medical_evidence_required=category == "COL",
+            defaults={
+                "annual_entitlement": DEFAULT_ENTITLEMENTS[category],
+                "employee_scope": kind,
+                "carry_forward": category in {"EL", "COL"},
+                "continuous_counting": category in CONTINUOUS_CATEGORIES,
+                "medical_evidence_required": category == "COL",
+            },
         )
     if not policy.enabled:
         raise ValidationError({"category": f"{category} is currently disabled by ELM policy."})
@@ -63,17 +66,20 @@ def _eligible(policy: LeavePolicy, employee_kind: str) -> bool:
     return policy.employee_scope == "all" or policy.employee_scope == employee_kind
 
 
-def _published_calendar():
-    return LeaveCalendar.objects.filter(status="published").order_by("-published_at", "-id").first()
-
-
 def _calendar_dates(start: date, end: date):
-    calendar = _published_calendar()
-    if not calendar:
-        return set(), set()
-    rows = LeaveCalendarDate.objects.filter(calendar=calendar, day__range=(start, end))
-    return ({r.day for r in rows if r.is_closed_day},
-            {r.day for r in rows if r.is_restricted_holiday})
+    # More than one year may remain published. Use each year's calendar so
+    # cross-year leave requests retain the correct closures and holidays.
+    calendars = LeaveCalendar.objects.filter(
+        status="published",
+        year__gte=start.year,
+        year__lte=end.year,
+    )
+    rows = LeaveCalendarDate.objects.filter(
+        calendar__in=calendars,
+        day__range=(start, end),
+    )
+    return ({row.day for row in rows if row.is_closed_day},
+            {row.day for row in rows if row.is_restricted_holiday})
 
 
 def _days_by_year(category, start, end, cl_half="none") -> dict[str, str]:
@@ -83,15 +89,24 @@ def _days_by_year(category, start, end, cl_half="none") -> dict[str, str]:
         segment_end = min(end, date(year, 12, 31))
         closed, _ = _calendar_dates(segment_start, segment_end)
         half = cl_half if start.year == end.year == year else "none"
-        units = count_leave_days(category, segment_start, segment_end, closed, half)
+        policy = LeavePolicy.objects.filter(category=category).first()
+        continuous_counting = policy.continuous_counting if policy is not None else None
+        units = count_leave_days(
+            category, segment_start, segment_end, closed, half, continuous_counting,
+        )
         if units > 0:
             result[str(year)] = str(units.quantize(Decimal("0.01")))
     return result
 
 
 def _balance(user_id, employee_kind, year, category) -> LeaveBalance:
-    policy = _policy(category)
-    entitlement = policy.annual_entitlement if _eligible(policy, employee_kind) else Decimal("0.00")
+    # Disabled policies block new applications, not reads or year-end
+    # carry-forward of balances that employees have already accrued.
+    policy = LeavePolicy.objects.filter(category=category).first()
+    if policy is None:
+        policy = _policy(category)
+    eligible = _eligible(policy, employee_kind)
+    entitlement = policy.annual_entitlement if eligible and policy.enabled else Decimal("0.00")
     balance, _ = LeaveBalance.objects.get_or_create(
         user_id=user_id, employee_kind=employee_kind, year=year, category=category,
         defaults={"entitlement": entitlement},
@@ -104,10 +119,25 @@ def _balance(user_id, employee_kind, year, category) -> LeaveBalance:
 def _assert_available(user_id, employee_kind, days_by_year, category):
     for year_text, units_text in days_by_year.items():
         balance = _balance(user_id, employee_kind, int(year_text), category)
-        if balance.available < Decimal(units_text):
+        balance = LeaveBalance.objects.select_for_update().get(pk=balance.pk)
+        # Pending applications reserve their requested units even before approval.
+        # Approved applications are already reflected in balance.consumed.
+        pending = LeaveApplication.objects.filter(
+            applicant_user_id=user_id,
+            employee_kind=employee_kind,
+            category=category,
+            status__in=ACTIVE_REQUEST_STATUSES,
+            request_type__in=("leave", "extension", "offline"),
+        )
+        reserved = sum(
+            (Decimal(app.requested_days_by_year.get(year_text, "0")) for app in pending),
+            Decimal("0"),
+        )
+        available = balance.available - reserved
+        if available < Decimal(units_text):
             raise ValidationError({
                 "period": (f"Insufficient {category} balance in {year_text}: "
-                           f"{balance.available} day(s) available, {units_text} requested.")
+                           f"{available} day(s) available after pending requests, {units_text} requested.")
             })
 
 
@@ -129,12 +159,22 @@ def _overlaps(user_id, start, end, category, cl_half, exclude_id=None):
     return None
 
 
-def _route_fields(department: str, category: str, director_case: bool = False):
+def _route_fields(department: str, category: str, director_case: bool = False, force_higher_sanction: bool = False):
     hierarchy = LeaveHierarchy.objects.filter(unit_key=department, active=True).first()
+    if hierarchy is None:
+        raise ValidationError({
+            "department": f"No active ELM hierarchy is configured for unit '{department or 'unknown'}'."
+        })
+    if director_case and not hierarchy.director_user_id:
+        raise ValidationError({"routing": "No Director is configured for this leave request."})
+    if not director_case and not hierarchy.unit_head_user_id:
+        raise ValidationError({"routing": f"No Unit Head is configured for unit '{department or 'unknown'}'."})
+    if not director_case and (category not in {"CL", "RH"} or force_higher_sanction) and not hierarchy.sanctioning_authority_user_id:
+        raise ValidationError({"routing": f"No sanctioning authority is configured for unit '{department or 'unknown'}'."})
     fields = {
-        "unit_head_user_id": hierarchy.unit_head_user_id if hierarchy else None,
-        "establishment_user_id": hierarchy.establishment_user_id if hierarchy else None,
-        "sanctioning_authority_user_id": hierarchy.sanctioning_authority_user_id if hierarchy else None,
+        "unit_head_user_id": hierarchy.unit_head_user_id,
+        "establishment_user_id": hierarchy.establishment_user_id,
+        "sanctioning_authority_user_id": hierarchy.sanctioning_authority_user_id,
     }
     if director_case:
         fields["current_assignee_user_id"] = hierarchy.director_user_id if hierarchy else None
@@ -206,7 +246,15 @@ def post_application_balance(app: LeaveApplication, actor_user_id: int):
             if LeaveLedgerEntry.objects.filter(reference_key=key).exists():
                 continue
             balance = _balance(app.applicant_user_id, app.employee_kind, int(year_text), app.category)
+            balance = LeaveBalance.objects.select_for_update().get(pk=balance.pk)
             amount = Decimal(units)
+            if app.request_type != "offline" and balance.available < amount:
+                raise ValidationError({
+                    "balance": (
+                        f"Insufficient {app.category} balance for year {year_text} "
+                        "at approval time. Refresh the request and balance before retrying."
+                    )
+                })
             balance.consumed += amount
             balance.save(update_fields=["consumed", "updated_at"])
             LeaveLedgerEntry.objects.create(
@@ -217,6 +265,7 @@ def post_application_balance(app: LeaveApplication, actor_user_id: int):
             )
 
 
+@transaction.atomic
 def create_leave_application(actor, data):
     employee_kind = _employee_kind(actor)
     category = data["category"]
@@ -265,7 +314,11 @@ def create_leave_application(actor, data):
         collision = _overlaps(int(substitute_id), start, end, category, data.get("cl_half", "none"))
         if collision:
             raise ValidationError({"substitute_user_id": "The substitute has overlapping pending or approved leave."})
-    is_director = "director" in {r.lower().replace(" ", "_") for r in (getattr(actor, "roles", ()) or ())} or (actor.active_role or "").lower() == "director"
+    active_role = (getattr(actor, "active_role", "") or "").lower()
+    is_director = (
+        "director" in {r.lower().replace(" ", "_") for r in (getattr(actor, "roles", ()) or ())}
+        or active_role == "director"
+    )
     routing = _route_fields(department, category, is_director)
     if needs_substitute:
         routing["status"] = "awaiting_substitute"
@@ -279,7 +332,8 @@ def create_leave_application(actor, data):
         station_leave_details=data.get("station_leave_details", ""),
         requires_substitute=needs_substitute, substitute_user_id=int(substitute_id) if needs_substitute else None,
         substitute_response="pending" if needs_substitute else "not_required",
-        evidence_reference=data.get("evidence_reference", ""), **routing,
+        evidence_reference=data.get("evidence_reference", ""),
+        director_case=is_director, **routing,
     )
     _record(app, actor.user_id, "submitted", "draft", app.status)
     _notify(app.current_assignee_user_id, app, "task_assigned", "A leave request requires your action.")
@@ -296,7 +350,7 @@ def respond_substitute(actor, app, response):
         app.substitute_response = "accepted" if response == "accept" else "declined"
         app.save(update_fields=["substitute_response", "updated_at"])
         if response == "accept":
-            route = _route_fields(app.department, app.category)
+            route = _route_fields(app.department, app.category, director_case=app.director_case)
             _transition(app, actor.user_id, route["status"], "substitute_accepted", assignee=route["current_assignee_user_id"])
             app.unit_head_user_id = route["unit_head_user_id"]
             app.establishment_user_id = route["establishment_user_id"]
@@ -307,12 +361,71 @@ def respond_substitute(actor, app, response):
         return app
 
 
+@transaction.atomic
+def retry_after_substitute_decline(actor, app, substitute_user_id=None):
+    app = LeaveApplication.objects.select_for_update().get(pk=app.pk)
+    if app.applicant_user_id != actor.user_id:
+        raise PermissionDenied("Only the applicant may retry a declined substitute request.")
+    if app.status != "action_required" or app.substitute_response != "declined":
+        raise ValidationError({"status": "Only a request with a declined substitute can be retried."})
+
+    if substitute_user_id is not None:
+        try:
+            substitute_user_id = int(substitute_user_id)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError({"substitute_user_id": "Must be a valid employee user ID."}) from exc
+        if not 1 <= substitute_user_id <= 2147483647:
+            raise ValidationError({"substitute_user_id": "Must be a positive 32-bit employee user ID."})
+        if substitute_user_id == actor.user_id:
+            raise ValidationError({"substitute_user_id": "The substitute must be another employee."})
+        try:
+            nominee = directory.get_users([substitute_user_id]).get(substitute_user_id)
+        except IamUnavailable as exc:
+            raise ValidationError({"substitute_user_id": "The employee directory is unavailable; retry later."}) from exc
+        if not nominee or nominee.kind not in {"faculty", "staff"}:
+            raise ValidationError({"substitute_user_id": "The substitute must be an active faculty/staff employee."})
+        collision = _overlaps(
+            substitute_user_id, app.start_date, app.end_date, app.category, app.cl_half,
+        )
+        if collision:
+            raise ValidationError({"substitute_user_id": "The substitute has overlapping pending or approved leave."})
+        app.requires_substitute = True
+        app.substitute_user_id = substitute_user_id
+        app.substitute_response = "pending"
+        app.save(update_fields=["requires_substitute", "substitute_user_id", "substitute_response", "updated_at"])
+        _transition(
+            app, actor.user_id, "awaiting_substitute", "substitute_reassigned",
+            "Applicant nominated a replacement substitute.", substitute_user_id,
+        )
+        return app
+
+    route = _route_fields(app.department, app.category, director_case=app.director_case)
+    app.requires_substitute = False
+    app.substitute_user_id = None
+    app.substitute_response = "not_required"
+    app.unit_head_user_id = route["unit_head_user_id"]
+    app.establishment_user_id = route["establishment_user_id"]
+    app.sanctioning_authority_user_id = route["sanctioning_authority_user_id"]
+    app.save(update_fields=[
+        "requires_substitute", "substitute_user_id", "substitute_response",
+        "unit_head_user_id", "establishment_user_id", "sanctioning_authority_user_id",
+        "updated_at",
+    ])
+    _transition(
+        app, actor.user_id, route["status"], "resubmitted_without_substitute",
+        "Applicant continued without a substitute.", route["current_assignee_user_id"],
+    )
+    return app
+
+
 def decide_request(actor, app, decision, note=""):
     with transaction.atomic():
         app = LeaveApplication.objects.select_for_update().get(pk=app.pk)
+        if not app.current_assignee_user_id and not actor.has_permission("elm.leave.manage"):
+            raise PermissionDenied("This request has no assignee. An ELM administrator must resolve its routing.")
         if app.current_assignee_user_id and app.current_assignee_user_id != actor.user_id and not actor.has_permission("elm.leave.manage"):
             raise PermissionDenied("This request is not assigned to you.")
-        if app.status == "awaiting_unit_head":
+        if app.status in {"awaiting_unit_head", "awaiting_cancellation_unit_head"}:
             if app.category in {"CL", "RH"} and app.request_type in {"leave", "offline"}:
                 if decision not in {"approve", "reject"}:
                     raise ValidationError({"decision": "Unit Head must approve or reject CL/RH."})
@@ -431,22 +544,31 @@ def _apply_resumption_review(app, actor_user_id, note):
     _notify(parent.applicant_user_id, app, "decision", "Your resumption review has been recorded.")
 
 
+@transaction.atomic
 def withdraw_request(actor, app, note=""):
+    app = LeaveApplication.objects.select_for_update().get(pk=app.pk)
     if app.applicant_user_id != actor.user_id:
         raise PermissionDenied("You may withdraw only your own request.")
     if app.status not in ACTIVE_REQUEST_STATUSES:
         raise ValidationError({"status": "Only pending requests can be withdrawn."})
+    previous_assignee = app.current_assignee_user_id
     _transition(app, actor.user_id, "withdrawn", "withdrawn", note)
-    _notify(app.current_assignee_user_id, app, "withdrawal", "The employee withdrew this ELM request.")
+    _notify(previous_assignee, app, "withdrawal", "The employee withdrew this ELM request.")
     return app
 
 
+@transaction.atomic
 def create_cancellation(actor, parent, reason=""):
+    parent = LeaveApplication.objects.select_for_update().get(pk=parent.pk)
     if parent.applicant_user_id != actor.user_id or parent.status != "approved":
         raise ValidationError({"request": "Only your own approved leave can be requested for cancellation."})
+    if parent.related_requests.filter(
+        request_type="cancellation", status__in=ACTIVE_REQUEST_STATUSES,
+    ).exists():
+        raise ValidationError({"request": "A cancellation request is already pending for this leave."})
     if parent.start_date <= timezone.localdate():
         raise ValidationError({"request": "Approved leave can be cancelled only before it starts."})
-    route = _route_fields(parent.department, parent.category)
+    route = _route_fields(parent.department, parent.category, force_higher_sanction=True)
     if parent.category in {"CL", "RH"}:
         status, assignee = "awaiting_unit_head", route["unit_head_user_id"]
     else:
@@ -467,7 +589,9 @@ def create_cancellation(actor, parent, reason=""):
     return child
 
 
+@transaction.atomic
 def create_extension(actor, parent, start, end, reason="", substitute_user_id=None):
+    parent = LeaveApplication.objects.select_for_update().get(pk=parent.pk)
     if parent.applicant_user_id != actor.user_id or parent.status != "approved":
         raise ValidationError({"request": "Only your own approved leave can be extended."})
     if parent.category not in {"EL", "COL", "VL"}:
@@ -476,11 +600,33 @@ def create_extension(actor, parent, start, end, reason="", substitute_user_id=No
         raise ValidationError({"request": "Extension is available only while the original leave is ongoing."})
     if start <= parent.end_date or start > end:
         raise ValidationError({"period": "The extension must start after the existing approved end date."})
+    overlap = _overlaps(parent.applicant_user_id, start, end, parent.category, "none")
+    if overlap:
+        raise ValidationError({"period": f"This overlaps active leave request EL-{overlap.pk}."})
     days_by_year = _days_by_year(parent.category, start, end)
     total = sum((Decimal(v) for v in days_by_year.values()), Decimal("0"))
     _assert_available(parent.applicant_user_id, parent.employee_kind, days_by_year, parent.category)
-    route = _route_fields(parent.department, parent.category)
+    director_case = parent.director_case
+    route = _route_fields(parent.department, parent.category, director_case=director_case)
     needs_substitute = substitute_user_id is not None
+    if needs_substitute:
+        try:
+            substitute_user_id = int(substitute_user_id)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError({"substitute_user_id": "Must be a valid employee user ID."}) from exc
+        if substitute_user_id < 1 or substitute_user_id > 2147483647:
+            raise ValidationError({"substitute_user_id": "Must be a positive 32-bit employee user ID."})
+        if substitute_user_id == actor.user_id:
+            raise ValidationError({"substitute_user_id": "The substitute must be another employee."})
+        try:
+            nominee = directory.get_users([substitute_user_id]).get(substitute_user_id)
+        except IamUnavailable as exc:
+            raise ValidationError({"substitute_user_id": "The employee directory is unavailable; retry later."}) from exc
+        if not nominee or nominee.kind not in {"faculty", "staff"}:
+            raise ValidationError({"substitute_user_id": "The substitute must be an active faculty/staff employee."})
+        collision = _overlaps(substitute_user_id, start, end, parent.category, "none")
+        if collision:
+            raise ValidationError({"substitute_user_id": "The substitute has overlapping pending or approved leave."})
     child = LeaveApplication.objects.create(
         applicant_user_id=parent.applicant_user_id, employee_kind=parent.employee_kind,
         department=parent.department, request_type="extension", parent_application=parent,
@@ -488,7 +634,8 @@ def create_extension(actor, parent, start, end, reason="", substitute_user_id=No
         requested_days_by_year=days_by_year, purpose=parent.purpose,
         requires_substitute=needs_substitute, substitute_user_id=substitute_user_id,
         substitute_response="pending" if needs_substitute else "not_required",
-        status="awaiting_substitute" if needs_substitute else "awaiting_unit_head",
+        director_case=director_case,
+        status="awaiting_substitute" if needs_substitute else route["status"],
         current_assignee_user_id=substitute_user_id if needs_substitute else route["current_assignee_user_id"],
         unit_head_user_id=route["unit_head_user_id"], establishment_user_id=route["establishment_user_id"],
         sanctioning_authority_user_id=route["sanctioning_authority_user_id"], action_reason=reason,
@@ -498,13 +645,21 @@ def create_extension(actor, parent, start, end, reason="", substitute_user_id=No
     return child
 
 
+@transaction.atomic
 def create_resumption(actor, parent, actual_date, details=""):
+    parent = LeaveApplication.objects.select_for_update().get(pk=parent.pk)
     if parent.applicant_user_id != actor.user_id or parent.status != "approved":
         raise ValidationError({"request": "Only your own approved leave can be resumed."})
+    if parent.related_requests.filter(request_type="resumption").exists():
+        raise ValidationError({"request": "A resumption review has already been submitted for this leave."})
     if parent.category not in {"EL", "COL", "VL"}:
         raise ValidationError({"category": "Formal resumption review applies to EL, COL, and VL."})
     hierarchy = LeaveHierarchy.objects.filter(unit_key=parent.department, active=True).first()
-    assignee = hierarchy.sanctioning_authority_user_id if hierarchy else None
+    if hierarchy is None or not hierarchy.sanctioning_authority_user_id:
+        raise ValidationError({"routing": "No sanctioning authority is configured for this unit."})
+    if actual_date < parent.start_date:
+        raise ValidationError({"actual_resumption_date": "Resumption date cannot precede the original leave start date."})
+    assignee = hierarchy.sanctioning_authority_user_id
     app = LeaveApplication.objects.create(
         applicant_user_id=parent.applicant_user_id, employee_kind=parent.employee_kind,
         department=parent.department, request_type="resumption", parent_application=parent,
@@ -521,7 +676,7 @@ def create_resumption(actor, parent, actual_date, details=""):
 
 
 def process_year_end(year: int, actor_user_id=None):
-    """Idempotent annual lapse/carry-forward/VL-to-EL conversion for existing accounts."""
+    """Run annual lapse/carry-forward/VL-to-EL conversion once per year."""
     with transaction.atomic():
         run, created = LeaveYearEndRun.objects.get_or_create(year=year, defaults={"run_by_user_id": actor_user_id})
         if not created:
@@ -531,24 +686,14 @@ def process_year_end(year: int, actor_user_id=None):
         processed = 0
         for account in accounts:
             available = max(Decimal("0"), account.available)
-            if account.category in {"CL", "RH", "SCL"}:
-                account.lapsed += available
-                account.save(update_fields=["lapsed", "updated_at"])
-            elif account.category in {"EL", "COL"}:
-                if available:
-                    next_account = _balance(account.user_id, account.employee_kind, year + 1, account.category)
-                    next_account.carried_in += available
-                    next_account.save(update_fields=["carried_in", "updated_at"])
-                    LeaveLedgerEntry.objects.get_or_create(reference_key=f"year-end:{year}:{account.user_id}:{account.category}:carry",
-                        defaults={"user_id": account.user_id, "employee_kind": account.employee_kind,
-                                  "year": year + 1, "category": account.category, "entry_type": "carry_forward",
-                                  "units": available, "actor_user_id": actor_user_id, "note": f"Carry forward from {year}"})
-            elif account.category == "VL":
+            policy = LeavePolicy.objects.filter(category=account.category).first()
+            if account.category == "VL":
                 account.converted_out += available
                 account.save(update_fields=["converted_out", "updated_at"])
                 converted = (available / Decimal("2")).quantize(Decimal("0.01"))
                 if converted:
                     el = _balance(account.user_id, account.employee_kind, year + 1, "EL")
+                    el = LeaveBalance.objects.select_for_update().get(pk=el.pk)
                     el.converted_in += converted
                     el.save(update_fields=["converted_in", "updated_at"])
                     LeaveLedgerEntry.objects.get_or_create(reference_key=f"year-end:{year}:{account.user_id}:VL:convert",
@@ -562,6 +707,34 @@ def process_year_end(year: int, actor_user_id=None):
                                   "year": year, "category": "VL", "entry_type": "convert_out",
                                   "units": available, "actor_user_id": actor_user_id,
                                   "note": f"Unused VL converted at year end {year}"})
+            elif policy is not None and policy.carry_forward:
+                if available:
+                    next_account = _balance(account.user_id, account.employee_kind, year + 1, account.category)
+                    next_account = LeaveBalance.objects.select_for_update().get(pk=next_account.pk)
+                    next_account.carried_in += available
+                    next_account.save(update_fields=["carried_in", "updated_at"])
+                    LeaveLedgerEntry.objects.get_or_create(
+                        reference_key=f"year-end:{year}:{account.user_id}:{account.category}:carry",
+                        defaults={
+                            "user_id": account.user_id, "employee_kind": account.employee_kind,
+                            "year": year + 1, "category": account.category, "entry_type": "carry_forward",
+                            "units": available, "actor_user_id": actor_user_id,
+                            "note": f"Carry forward from {year}",
+                        },
+                    )
+            else:
+                account.lapsed += available
+                account.save(update_fields=["lapsed", "updated_at"])
+                if available:
+                    LeaveLedgerEntry.objects.get_or_create(
+                        reference_key=f"year-end:{year}:{account.user_id}:{account.category}:lapse",
+                        defaults={
+                            "user_id": account.user_id, "employee_kind": account.employee_kind,
+                            "year": year, "category": account.category, "entry_type": "lapse",
+                            "units": available, "actor_user_id": actor_user_id,
+                            "note": f"Unused {account.category} balance lapsed at year end {year}",
+                        },
+                    )
             processed += 1
         run.processed_accounts = processed
         run.exceptions = exceptions
@@ -580,12 +753,19 @@ def process_sla_thresholds(now=None):
                                                created_at__lte=now - timedelta(hours=config.reminder_after_hours))
     events_created = 0
     for app in pending.iterator():
-        if not LeaveSLAEvent.objects.filter(application=app, event_type="reminder").exists():
-            LeaveSLAEvent.objects.create(application=app, event_type="reminder", note="Pending at reminder threshold")
+        _, reminder_created = LeaveSLAEvent.objects.get_or_create(
+            application=app, event_type="reminder",
+            defaults={"note": "Pending at reminder threshold"},
+        )
+        if reminder_created:
             _notify(app.current_assignee_user_id, app, "sla_reminder", "An ELM task is still pending; please review it.")
             events_created += 1
-        if app.created_at <= now - timedelta(hours=config.escalation_after_hours) and not LeaveSLAEvent.objects.filter(application=app, event_type="escalation").exists():
-            LeaveSLAEvent.objects.create(application=app, event_type="escalation", note="Pending past escalation threshold")
-            _notify(config.escalation_user_id or app.current_assignee_user_id, app, "sla_escalation", "An ELM task has crossed its escalation threshold.")
-            events_created += 1
+        if app.created_at <= now - timedelta(hours=config.escalation_after_hours):
+            _, escalation_created = LeaveSLAEvent.objects.get_or_create(
+                application=app, event_type="escalation",
+                defaults={"note": "Pending past escalation threshold"},
+            )
+            if escalation_created:
+                _notify(config.escalation_user_id or app.current_assignee_user_id, app, "sla_escalation", "An ELM task has crossed its escalation threshold.")
+                events_created += 1
     return events_created

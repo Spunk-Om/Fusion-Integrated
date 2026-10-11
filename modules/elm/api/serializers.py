@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from modules.elm.models import LeaveApplication, LeaveCalendar, LeaveCalendarDate, LeaveHierarchy, LeavePolicy
+from modules.elm.models import LeaveApplication, LeaveCalendar, LeaveCalendarDate, LeaveHierarchy, LeavePolicy, VacationPeriod
 
 
 class LeaveApplicationInputSerializer(serializers.Serializer):
@@ -13,7 +13,7 @@ class LeaveApplicationInputSerializer(serializers.Serializer):
     station_leave = serializers.BooleanField(required=False, default=False)
     station_leave_details = serializers.CharField(max_length=1000, required=False, allow_blank=True, default="")
     requires_substitute = serializers.BooleanField(required=False, default=False)
-    substitute_user_id = serializers.IntegerField(required=False, allow_null=True)
+    substitute_user_id = serializers.IntegerField(required=False, allow_null=True, min_value=1, max_value=2147483647)
     evidence_reference = serializers.CharField(max_length=240, required=False, allow_blank=True, default="")
 
     def validate(self, attrs):
@@ -53,6 +53,12 @@ class SubstituteResponseSerializer(serializers.Serializer):
     response = serializers.ChoiceField(choices=[("accept", "Accept"), ("decline", "Decline")])
 
 
+class RetryAfterDeclineSerializer(serializers.Serializer):
+    substitute_user_id = serializers.IntegerField(
+        required=False, allow_null=True, min_value=1, max_value=2147483647,
+    )
+
+
 class ActionReasonSerializer(serializers.Serializer):
     reason = serializers.CharField(max_length=1000, required=False, allow_blank=True, default="")
 
@@ -60,7 +66,7 @@ class ActionReasonSerializer(serializers.Serializer):
 class ExtensionSerializer(ActionReasonSerializer):
     start_date = serializers.DateField()
     end_date = serializers.DateField()
-    substitute_user_id = serializers.IntegerField(required=False, allow_null=True)
+    substitute_user_id = serializers.IntegerField(required=False, allow_null=True, min_value=1, max_value=2147483647)
 
     def validate(self, attrs):
         if attrs["start_date"] > attrs["end_date"]:
@@ -73,12 +79,35 @@ class ResumptionSerializer(serializers.Serializer):
     details = serializers.CharField(max_length=1000, required=False, allow_blank=True, default="")
 
 
+class OfflineLeaveRecordSerializer(serializers.Serializer):
+    applicant_user_id = serializers.IntegerField(min_value=1, max_value=2147483647)
+    employee_kind = serializers.ChoiceField(choices=[("faculty", "Faculty"), ("staff", "Staff")])
+    category = serializers.ChoiceField(choices=[(c, c) for c in ("CL", "RH", "SCL", "EL", "COL", "VL")])
+    start_date = serializers.DateField()
+    end_date = serializers.DateField()
+    purpose = serializers.CharField(max_length=1000)
+    evidence_reference = serializers.CharField(max_length=240)
+    department = serializers.CharField(max_length=120, required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        if attrs["end_date"] < attrs["start_date"]:
+            raise serializers.ValidationError({"end_date": "End date must not precede start date."})
+        if not attrs["evidence_reference"].strip():
+            raise serializers.ValidationError({"evidence_reference": "Evidence reference must not be blank."})
+        return attrs
+
+
 class LeavePolicySerializer(serializers.ModelSerializer):
+    def validate_annual_entitlement(self, value):
+        if value < 0:
+            raise serializers.ValidationError("Annual entitlement cannot be negative.")
+        return value
+
     class Meta:
         model = LeavePolicy
         fields = ("id", "category", "annual_entitlement", "employee_scope", "carry_forward",
                   "continuous_counting", "medical_evidence_required", "enabled", "created_at", "updated_at")
-        read_only_fields = ("id", "created_at", "updated_at")
+        read_only_fields = ("id", "category", "created_at", "updated_at")
 
 
 class LeaveCalendarSerializer(serializers.ModelSerializer):
@@ -93,6 +122,13 @@ class LeaveCalendarDateSerializer(serializers.ModelSerializer):
         model = LeaveCalendarDate
         fields = ("id", "calendar", "day", "name", "is_restricted_holiday", "is_closed_day")
 
+    def validate(self, attrs):
+        calendar = attrs.get("calendar", getattr(self.instance, "calendar", None))
+        day = attrs.get("day", getattr(self.instance, "day", None))
+        if calendar is not None and day is not None and day.year != calendar.year:
+            raise serializers.ValidationError({"day": "The date must belong to the selected calendar year."})
+        return attrs
+
 
 class LeaveHierarchySerializer(serializers.ModelSerializer):
     class Meta:
@@ -100,3 +136,38 @@ class LeaveHierarchySerializer(serializers.ModelSerializer):
         fields = ("id", "unit_key", "unit_head_user_id", "establishment_user_id",
                   "sanctioning_authority_user_id", "director_user_id", "active")
         read_only_fields = ("id",)
+
+    def validate(self, attrs):
+        active = attrs.get("active", getattr(self.instance, "active", True))
+        unit_head = attrs.get("unit_head_user_id", getattr(self.instance, "unit_head_user_id", None))
+        sanctioner = attrs.get(
+            "sanctioning_authority_user_id",
+            getattr(self.instance, "sanctioning_authority_user_id", None),
+        )
+        if active and not unit_head:
+            raise serializers.ValidationError({"unit_head_user_id": "An active hierarchy requires a Unit Head."})
+        if active and not sanctioner:
+            raise serializers.ValidationError({
+                "sanctioning_authority_user_id": "An active hierarchy requires a sanctioning authority."
+            })
+        for field in ("unit_head_user_id", "establishment_user_id",
+                      "sanctioning_authority_user_id", "director_user_id"):
+            user_id = attrs.get(field, getattr(self.instance, field, None))
+            if user_id is not None and not 1 <= user_id <= 2147483647:
+                raise serializers.ValidationError({field: "Must be a positive 32-bit user ID or blank."})
+        return attrs
+
+
+class VacationPeriodSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VacationPeriod
+        fields = ("id", "name", "start_date", "end_date", "external_reference", "active",
+                  "created_at", "updated_at")
+        read_only_fields = ("id", "created_at", "updated_at")
+
+    def validate(self, attrs):
+        start = attrs.get("start_date", getattr(self.instance, "start_date", None))
+        end = attrs.get("end_date", getattr(self.instance, "end_date", None))
+        if start is not None and end is not None and end < start:
+            raise serializers.ValidationError({"end_date": "End date must not precede start date."})
+        return attrs
