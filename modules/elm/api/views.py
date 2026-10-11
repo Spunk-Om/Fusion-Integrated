@@ -213,7 +213,10 @@ class LeaveApplicationExportView(APIView):
 class LeavePolicyView(APIView):
     permission_classes = [MODULE, HasPermission(P_MANAGE)]
 
-    def get(self, request):
+    def get(self, request, category=None):
+        if category is not None:
+            policy = get_object_or_404(LeavePolicy, category=category)
+            return Response(LeavePolicySerializer(policy).data)
         return Response(LeavePolicySerializer(LeavePolicy.objects.order_by("category"), many=True).data)
 
     def patch(self, request, category):
