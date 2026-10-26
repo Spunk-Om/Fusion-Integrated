@@ -4,6 +4,8 @@ from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema, extend_schema_view
 from rest_framework import status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
@@ -11,23 +13,46 @@ from rest_framework.views import APIView
 
 from fusion_auth.permissions import HasModuleGrant, HasPermission
 from modules.elm.api.serializers import (
-    ActionReasonSerializer, DecisionSerializer, ExtensionSerializer,
-    LeaveApplicationInputSerializer, LeaveApplicationSerializer,
-    LeaveCalendarDateSerializer, LeaveCalendarSerializer,
-    LeaveHierarchySerializer, LeavePolicySerializer, ResumptionSerializer,
-    RetryAfterDeclineSerializer, SubstituteResponseSerializer, VacationPeriodSerializer,
+    ActionReasonSerializer,
+    DecisionSerializer,
+    ExtensionSerializer,
+    LeaveApplicationInputSerializer,
+    LeaveApplicationSerializer,
+    LeaveCalendarDateSerializer,
+    LeaveCalendarSerializer,
+    LeaveHierarchySerializer,
+    LeavePolicySerializer,
     OfflineLeaveRecordSerializer,
+    ResumptionSerializer,
+    RetryAfterDeclineSerializer,
+    SubstituteResponseSerializer,
+    VacationPeriodSerializer,
 )
 from modules.elm.models import (
-    LeaveApplication, LeaveCalendar, LeaveCalendarDate, LeaveHierarchy,
-    LeaveNotice, LeavePolicy, LeaveSLAConfig, VacationPeriod,
+    LeaveApplication,
+    LeaveCalendar,
+    LeaveCalendarDate,
+    LeaveHierarchy,
+    LeaveNotice,
+    LeavePolicy,
+    LeaveSLAConfig,
+    VacationPeriod,
 )
 from modules.elm.services import (
-    _employee_kind, _record,
-    create_cancellation, create_extension, create_leave_application,
-    create_resumption, decide_request, post_application_balance,
-    process_sla_thresholds, process_year_end, respond_substitute,
-    retry_after_substitute_decline, withdraw_request,
+    _balance,
+    _employee_kind,
+    _record,
+    create_cancellation,
+    create_extension,
+    create_leave_application,
+    create_resumption,
+    decide_request,
+    post_application_balance,
+    process_sla_thresholds,
+    process_year_end,
+    respond_substitute,
+    retry_after_substitute_decline,
+    withdraw_request,
 )
 
 MODULE = HasModuleGrant("elm")
@@ -49,13 +74,27 @@ def _accessible(app, actor):
     is_pending_substitute = (
         app.substitute_user_id == actor.user_id and app.status == "awaiting_substitute"
     )
-    return (app.applicant_user_id == actor.user_id
-            or app.current_assignee_user_id == actor.user_id
-            or is_pending_substitute
-            or actor.has_permission(P_VIEW_ALL)
-            or actor.has_permission(P_MANAGE))
+    return (
+        app.applicant_user_id == actor.user_id
+        or app.current_assignee_user_id == actor.user_id
+        or is_pending_substitute
+        or actor.has_permission(P_VIEW_ALL)
+        or actor.has_permission(P_MANAGE)
+    )
 
 
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="elm_leave_requests_list",
+        request=None,
+        responses=OpenApiTypes.OBJECT,
+    ),
+    post=extend_schema(
+        operation_id="elm_leave_requests_create",
+        request=LeaveApplicationInputSerializer,
+        responses={201: LeaveApplicationSerializer},
+    ),
+)
 class LeaveRequestListCreateView(APIView):
     def get_permissions(self):
         if self.request.method == "POST":
@@ -73,21 +112,29 @@ class LeaveRequestListCreateView(APIView):
         if scope == "mine":
             qs = qs.filter(applicant_user_id=actor.user_id)
         elif scope == "assigned":
-            assigned = (
-                Q(current_assignee_user_id=actor.user_id)
-                | Q(substitute_user_id=actor.user_id, status="awaiting_substitute")
+            assigned = Q(current_assignee_user_id=actor.user_id) | Q(
+                substitute_user_id=actor.user_id, status="awaiting_substitute"
             )
             if actor.has_permission(P_MANAGE):
                 assigned |= Q(
                     current_assignee_user_id__isnull=True,
-                    status__in=("awaiting_unit_head", "awaiting_establishment", "awaiting_sanction",
-                                "awaiting_cancellation_sanction", "awaiting_resumption_review",
-                                "action_required"),
+                    status__in=(
+                        "awaiting_unit_head",
+                        "awaiting_establishment",
+                        "awaiting_sanction",
+                        "awaiting_cancellation_sanction",
+                        "awaiting_resumption_review",
+                        "action_required",
+                    ),
                 )
             qs = qs.filter(assigned)
         elif actor.has_permission(P_VIEW_ALL) or actor.has_permission(P_MANAGE):
             pass
-        elif actor.has_permission(P_REVIEW) or actor.has_permission(P_SANCTION) or actor.has_permission(P_SUBSTITUTE):
+        elif (
+            actor.has_permission(P_REVIEW)
+            or actor.has_permission(P_SANCTION)
+            or actor.has_permission(P_SUBSTITUTE)
+        ):
             qs = qs.filter(
                 Q(applicant_user_id=actor.user_id)
                 | Q(current_assignee_user_id=actor.user_id)
@@ -111,8 +158,18 @@ class LeaveRequestListCreateView(APIView):
         return Response(LeaveApplicationSerializer(app).data, status=status.HTTP_201_CREATED)
 
 
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="elm_leave_request_retrieve",
+        request=None,
+        responses=LeaveApplicationSerializer,
+    )
+)
 class LeaveRequestDetailView(APIView):
-    permission_classes = [MODULE, HasPermission(P_VIEW_SELF, P_VIEW_ALL, P_REVIEW, P_SANCTION, P_SUBSTITUTE, P_MANAGE)]
+    permission_classes = [
+        MODULE,
+        HasPermission(P_VIEW_SELF, P_VIEW_ALL, P_REVIEW, P_SANCTION, P_SUBSTITUTE, P_MANAGE),
+    ]
 
     def get(self, request, pk):
         app = get_object_or_404(LeaveApplication, pk=pk)
@@ -121,6 +178,13 @@ class LeaveRequestDetailView(APIView):
         return Response(LeaveApplicationSerializer(app).data)
 
 
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="elm_substitute_response",
+        request=SubstituteResponseSerializer,
+        responses=OpenApiTypes.OBJECT,
+    )
+)
 class SubstituteResponseView(APIView):
     permission_classes = [MODULE, HasPermission(P_SUBSTITUTE)]
 
@@ -128,9 +192,20 @@ class SubstituteResponseView(APIView):
         payload = SubstituteResponseSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
         app = get_object_or_404(LeaveApplication, pk=pk)
-        return Response(LeaveApplicationSerializer(respond_substitute(_actor(request), app, payload.validated_data["response"])).data)
+        return Response(
+            LeaveApplicationSerializer(
+                respond_substitute(_actor(request), app, payload.validated_data["response"])
+            ).data
+        )
 
 
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="elm_retry_after_decline",
+        request=RetryAfterDeclineSerializer,
+        responses=LeaveApplicationSerializer,
+    )
+)
 class RetryAfterDeclineView(APIView):
     permission_classes = [MODULE, HasPermission(P_CREATE)]
 
@@ -139,11 +214,20 @@ class RetryAfterDeclineView(APIView):
         payload.is_valid(raise_exception=True)
         app = get_object_or_404(LeaveApplication, pk=pk)
         updated = retry_after_substitute_decline(
-            _actor(request), app, payload.validated_data.get("substitute_user_id"),
+            _actor(request),
+            app,
+            payload.validated_data.get("substitute_user_id"),
         )
         return Response(LeaveApplicationSerializer(updated).data)
 
 
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="elm_leave_decision",
+        request=DecisionSerializer,
+        responses=OpenApiTypes.OBJECT,
+    )
+)
 class LeaveDecisionView(APIView):
     permission_classes = [MODULE, HasPermission(P_REVIEW, P_SANCTION, P_MANAGE)]
 
@@ -152,14 +236,37 @@ class LeaveDecisionView(APIView):
         payload.is_valid(raise_exception=True)
         app = get_object_or_404(LeaveApplication, pk=pk)
         actor = _actor(request)
-        if app.status in {"awaiting_unit_head", "awaiting_cancellation_unit_head", "awaiting_establishment"} and not (actor.has_permission(P_REVIEW) or actor.has_permission(P_MANAGE)):
+        if app.status in {
+            "awaiting_unit_head",
+            "awaiting_cancellation_unit_head",
+            "awaiting_establishment",
+        } and not (actor.has_permission(P_REVIEW) or actor.has_permission(P_MANAGE)):
             raise PermissionDenied("This action requires ELM review permission.")
-        if app.status in {"awaiting_sanction", "awaiting_cancellation_sanction", "awaiting_resumption_review"} and not (actor.has_permission(P_SANCTION) or actor.has_permission(P_MANAGE)):
+        if app.status in {
+            "awaiting_sanction",
+            "awaiting_cancellation_sanction",
+            "awaiting_resumption_review",
+        } and not (actor.has_permission(P_SANCTION) or actor.has_permission(P_MANAGE)):
             raise PermissionDenied("This action requires ELM sanction permission.")
-        return Response(LeaveApplicationSerializer(decide_request(
-            actor, app, payload.validated_data["decision"], payload.validated_data.get("note", ""))).data)
+        return Response(
+            LeaveApplicationSerializer(
+                decide_request(
+                    actor,
+                    app,
+                    payload.validated_data["decision"],
+                    payload.validated_data.get("note", ""),
+                )
+            ).data
+        )
 
 
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="elm_leave_withdraw",
+        request=ActionReasonSerializer,
+        responses=OpenApiTypes.OBJECT,
+    )
+)
 class WithdrawRequestView(APIView):
     permission_classes = [MODULE, HasPermission(P_CREATE)]
 
@@ -167,46 +274,103 @@ class WithdrawRequestView(APIView):
         payload = ActionReasonSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
         app = get_object_or_404(LeaveApplication, pk=pk)
-        return Response(LeaveApplicationSerializer(withdraw_request(_actor(request), app, payload.validated_data["reason"])).data)
+        return Response(
+            LeaveApplicationSerializer(
+                withdraw_request(_actor(request), app, payload.validated_data["reason"])
+            ).data
+        )
 
 
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="elm_leave_cancel",
+        request=ActionReasonSerializer,
+        responses=OpenApiTypes.OBJECT,
+    )
+)
 class CancelLeaveView(APIView):
     permission_classes = [MODULE, HasPermission(P_CREATE)]
 
     def post(self, request, pk):
         payload = ActionReasonSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
-        parent = get_object_or_404(LeaveApplication, pk=pk, request_type__in=("leave", "offline", "extension"))
-        return Response(LeaveApplicationSerializer(create_cancellation(_actor(request), parent, payload.validated_data["reason"])).data,
-                        status=status.HTTP_201_CREATED)
+        parent = get_object_or_404(
+            LeaveApplication, pk=pk, request_type__in=("leave", "offline", "extension")
+        )
+        return Response(
+            LeaveApplicationSerializer(
+                create_cancellation(_actor(request), parent, payload.validated_data["reason"])
+            ).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="elm_leave_extend",
+        request=ExtensionSerializer,
+        responses=OpenApiTypes.OBJECT,
+    )
+)
 class ExtendLeaveView(APIView):
     permission_classes = [MODULE, HasPermission(P_CREATE)]
 
     def post(self, request, pk):
         payload = ExtensionSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
-        parent = get_object_or_404(LeaveApplication, pk=pk, request_type__in=("leave", "extension", "offline"))
+        parent = get_object_or_404(
+            LeaveApplication, pk=pk, request_type__in=("leave", "extension", "offline")
+        )
         data = payload.validated_data
-        return Response(LeaveApplicationSerializer(create_extension(
-            _actor(request), parent, data["start_date"], data["end_date"],
-            data.get("reason", ""), data.get("substitute_user_id"))).data, status=status.HTTP_201_CREATED)
+        return Response(
+            LeaveApplicationSerializer(
+                create_extension(
+                    _actor(request),
+                    parent,
+                    data["start_date"],
+                    data["end_date"],
+                    data.get("reason", ""),
+                    data.get("substitute_user_id"),
+                )
+            ).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="elm_leave_resume",
+        request=ResumptionSerializer,
+        responses=OpenApiTypes.OBJECT,
+    )
+)
 class ResumptionView(APIView):
     permission_classes = [MODULE, HasPermission(P_CREATE)]
 
     def post(self, request, pk):
         payload = ResumptionSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
-        parent = get_object_or_404(LeaveApplication, pk=pk, request_type__in=("leave", "extension", "offline"))
+        parent = get_object_or_404(
+            LeaveApplication, pk=pk, request_type__in=("leave", "extension", "offline")
+        )
         data = payload.validated_data
-        return Response(LeaveApplicationSerializer(create_resumption(
-            _actor(request), parent, data["actual_resumption_date"], data.get("details", ""))).data,
-            status=status.HTTP_201_CREATED)
+        return Response(
+            LeaveApplicationSerializer(
+                create_resumption(
+                    _actor(request), parent, data["actual_resumption_date"], data.get("details", "")
+                )
+            ).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="elm_leave_balances_list",
+        request=None,
+        responses=OpenApiTypes.OBJECT,
+    )
+)
 class LeaveBalanceView(APIView):
     permission_classes = [MODULE, HasPermission(P_VIEW_SELF, P_VIEW_ALL, P_MANAGE)]
 
@@ -235,39 +399,89 @@ class LeaveBalanceView(APIView):
         rows = []
         for policy in LeavePolicy.objects.filter(enabled=True).order_by("category"):
             balance = _balance(user_id, kind, year, policy.category)
-            rows.append({"year": year, "category": policy.category,
-                         "entitlement": str(balance.entitlement), "carried_in": str(balance.carried_in),
-                         "converted_in": str(balance.converted_in), "consumed": str(balance.consumed),
-                         "lapsed": str(balance.lapsed), "converted_out": str(balance.converted_out),
-                         "available": str(balance.available)})
+            rows.append(
+                {
+                    "year": year,
+                    "category": policy.category,
+                    "entitlement": str(balance.entitlement),
+                    "carried_in": str(balance.carried_in),
+                    "converted_in": str(balance.converted_in),
+                    "consumed": str(balance.consumed),
+                    "lapsed": str(balance.lapsed),
+                    "converted_out": str(balance.converted_out),
+                    "available": str(balance.available),
+                }
+            )
         return Response({"results": rows})
 
 
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="elm_leave_application_export",
+        request=None,
+        responses=OpenApiTypes.STR,
+    )
+)
 class LeaveApplicationExportView(APIView):
     permission_classes = [MODULE, HasPermission(P_EXPORT)]
 
     def get(self, request, pk):
         app = get_object_or_404(LeaveApplication, pk=pk)
-        if app.applicant_user_id != _actor(request).user_id and not _actor(request).has_permission(P_VIEW_ALL):
+        if app.applicant_user_id != _actor(request).user_id and not _actor(request).has_permission(
+            P_VIEW_ALL
+        ):
             raise PermissionDenied("You may export only your own leave application.")
-        lines = ["Fusion ERP — Employee Leave Management", f"Request ID: EL-{app.pk}",
-                 f"Type: {app.request_type}", f"Employee ID: {app.applicant_user_id}",
-                 f"Category: {app.category}", f"Period: {app.start_date} to {app.end_date}",
-                 f"Requested days: {app.requested_days}", f"Purpose: {app.purpose}",
-                 f"Station Leave: {'Yes' if app.station_leave else 'No'}",
-                 f"Status: {app.status}", f"Decision: {app.final_decision or 'Pending'}",
-                 f"Decision note: {app.final_decision_note}"]
+        lines = [
+            "Fusion ERP — Employee Leave Management",
+            f"Request ID: EL-{app.pk}",
+            f"Type: {app.request_type}",
+            f"Employee ID: {app.applicant_user_id}",
+            f"Category: {app.category}",
+            f"Period: {app.start_date} to {app.end_date}",
+            f"Requested days: {app.requested_days}",
+            f"Purpose: {app.purpose}",
+            f"Station Leave: {'Yes' if app.station_leave else 'No'}",
+            f"Status: {app.status}",
+            f"Decision: {app.final_decision or 'Pending'}",
+            f"Decision note: {app.final_decision_note}",
+        ]
         return Response("\n".join(lines), content_type="text/plain; charset=utf-8")
 
 
-class LeavePolicyView(APIView):
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="elm_leave_policies_list",
+        request=None,
+        responses=LeavePolicySerializer(many=True),
+    )
+)
+class LeavePolicyListView(APIView):
     permission_classes = [MODULE, HasPermission(P_MANAGE)]
 
-    def get(self, request, category=None):
-        if category is not None:
-            policy = get_object_or_404(LeavePolicy, category=category)
-            return Response(LeavePolicySerializer(policy).data)
-        return Response(LeavePolicySerializer(LeavePolicy.objects.order_by("category"), many=True).data)
+    def get(self, request):
+        return Response(
+            LeavePolicySerializer(LeavePolicy.objects.order_by("category"), many=True).data
+        )
+
+
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="elm_leave_policy_retrieve",
+        request=None,
+        responses=LeavePolicySerializer,
+    ),
+    patch=extend_schema(
+        operation_id="elm_leave_policy_update",
+        request=LeavePolicySerializer,
+        responses=LeavePolicySerializer,
+    ),
+)
+class LeavePolicyDetailView(APIView):
+    permission_classes = [MODULE, HasPermission(P_MANAGE)]
+
+    def get(self, request, category):
+        policy = get_object_or_404(LeavePolicy, category=category)
+        return Response(LeavePolicySerializer(policy).data)
 
     def patch(self, request, category):
         policy = get_object_or_404(LeavePolicy, category=category)
@@ -277,6 +491,18 @@ class LeavePolicyView(APIView):
         return Response(payload.data)
 
 
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="elm_calendars_list",
+        request=None,
+        responses=LeaveCalendarSerializer(many=True),
+    ),
+    post=extend_schema(
+        operation_id="elm_calendars_create",
+        request=LeaveCalendarSerializer,
+        responses={201: LeaveCalendarSerializer},
+    ),
+)
 class LeaveCalendarView(APIView):
     permission_classes = [MODULE, HasPermission(P_MANAGE)]
 
@@ -290,6 +516,18 @@ class LeaveCalendarView(APIView):
         return Response(LeaveCalendarSerializer(calendar).data, status=status.HTTP_201_CREATED)
 
 
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="elm_calendar_dates_list",
+        request=None,
+        responses=LeaveCalendarDateSerializer(many=True),
+    ),
+    post=extend_schema(
+        operation_id="elm_calendar_dates_create",
+        request=LeaveCalendarDateSerializer,
+        responses={201: LeaveCalendarDateSerializer},
+    ),
+)
 class LeaveCalendarDateView(APIView):
     permission_classes = [MODULE, HasPermission(P_MANAGE)]
 
@@ -302,36 +540,80 @@ class LeaveCalendarDateView(APIView):
         get_object_or_404(LeaveCalendar, pk=pk, status="draft")
         payload = LeaveCalendarDateSerializer(data={**request.data, "calendar": pk})
         payload.is_valid(raise_exception=True)
-        return Response(LeaveCalendarDateSerializer(payload.save()).data, status=status.HTTP_201_CREATED)
+        return Response(
+            LeaveCalendarDateSerializer(payload.save()).data, status=status.HTTP_201_CREATED
+        )
 
 
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="elm_calendar_publish",
+        request=None,
+        responses=LeaveCalendarSerializer,
+    )
+)
 class PublishLeaveCalendarView(APIView):
     permission_classes = [MODULE, HasPermission(P_MANAGE)]
 
     def post(self, request, pk):
         with transaction.atomic():
             calendar = get_object_or_404(LeaveCalendar.objects.select_for_update(), pk=pk)
-            LeaveCalendar.objects.filter(status="published", year=calendar.year).exclude(pk=calendar.pk).update(status="draft", updated_at=timezone.now())
+            LeaveCalendar.objects.filter(status="published", year=calendar.year).exclude(
+                pk=calendar.pk
+            ).update(status="draft", updated_at=timezone.now())
             calendar.status = "published"
             calendar.published_by_user_id = _actor(request).user_id
             calendar.published_at = timezone.now()
-            calendar.save(update_fields=["status", "published_by_user_id", "published_at", "updated_at"])
+            calendar.save(
+                update_fields=["status", "published_by_user_id", "published_at", "updated_at"]
+            )
         return Response(LeaveCalendarSerializer(calendar).data)
 
 
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="elm_leave_hierarchy_list",
+        request=None,
+        responses=LeaveHierarchySerializer(many=True),
+    ),
+    post=extend_schema(
+        operation_id="elm_leave_hierarchy_create",
+        request=LeaveHierarchySerializer,
+        responses={201: LeaveHierarchySerializer},
+    ),
+)
 class LeaveHierarchyView(APIView):
     permission_classes = [MODULE, HasPermission(P_MANAGE)]
 
     def get(self, request):
-        return Response(LeaveHierarchySerializer(LeaveHierarchy.objects.all()[:500], many=True).data)
+        return Response(
+            LeaveHierarchySerializer(LeaveHierarchy.objects.all()[:500], many=True).data
+        )
 
     def post(self, request):
         payload = LeaveHierarchySerializer(data=request.data)
         payload.is_valid(raise_exception=True)
-        row, created = LeaveHierarchy.objects.update_or_create(unit_key=payload.validated_data["unit_key"], defaults=payload.validated_data)
-        return Response(LeaveHierarchySerializer(row).data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+        row, created = LeaveHierarchy.objects.update_or_create(
+            unit_key=payload.validated_data["unit_key"], defaults=payload.validated_data
+        )
+        return Response(
+            LeaveHierarchySerializer(row).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
 
 
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="elm_vacation_periods_list",
+        request=None,
+        responses=OpenApiTypes.OBJECT,
+    ),
+    post=extend_schema(
+        operation_id="elm_vacation_periods_create",
+        request=VacationPeriodSerializer,
+        responses={201: VacationPeriodSerializer},
+    ),
+)
 class VacationPeriodListCreateView(APIView):
     permission_classes = [MODULE, HasPermission(P_MANAGE)]
 
@@ -346,6 +628,28 @@ class VacationPeriodListCreateView(APIView):
         return Response(VacationPeriodSerializer(period).data, status=status.HTTP_201_CREATED)
 
 
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="elm_vacation_period_retrieve",
+        request=None,
+        responses=VacationPeriodSerializer,
+    ),
+    patch=extend_schema(
+        operation_id="elm_vacation_period_update",
+        request=VacationPeriodSerializer,
+        responses=VacationPeriodSerializer,
+    ),
+    put=extend_schema(
+        operation_id="elm_vacation_period_replace",
+        request=VacationPeriodSerializer,
+        responses=VacationPeriodSerializer,
+    ),
+    delete=extend_schema(
+        operation_id="elm_vacation_period_delete",
+        request=None,
+        responses={204: OpenApiTypes.NONE},
+    ),
+)
 class VacationPeriodDetailView(APIView):
     permission_classes = [MODULE, HasPermission(P_MANAGE)]
 
@@ -372,6 +676,13 @@ class VacationPeriodDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="elm_offline_leave_record_create",
+        request=OfflineLeaveRecordSerializer,
+        responses={201: LeaveApplicationSerializer},
+    )
+)
 class OfflineLeaveRecordView(APIView):
     permission_classes = [MODULE, HasPermission(P_MANAGE)]
 
@@ -381,49 +692,90 @@ class OfflineLeaveRecordView(APIView):
         payload.is_valid(raise_exception=True)
         data = payload.validated_data
         if LeaveApplication.objects.filter(
-            request_type="offline", evidence_reference=data["evidence_reference"],
+            request_type="offline",
+            evidence_reference=data["evidence_reference"],
         ).exists():
-            raise ValidationError({"evidence_reference": "This offline sanction has already been recorded."})
+            raise ValidationError(
+                {"evidence_reference": "This offline sanction has already been recorded."}
+            )
         start, end, category = data["start_date"], data["end_date"], data["category"]
         from modules.elm.services import _days_by_year
+
         days_by_year = _days_by_year(category, start, end)
         total = sum((Decimal(value) for value in days_by_year.values()), Decimal("0"))
         if total <= 0:
-            raise ValidationError({"period": "The selected period contains no countable leave days."})
+            raise ValidationError(
+                {"period": "The selected period contains no countable leave days."}
+            )
         try:
             # Nested atomic creates a savepoint so a concurrent duplicate can be
             # translated into a validation response without poisoning the outer
             # transaction.
             with transaction.atomic():
                 app = LeaveApplication.objects.create(
-                    applicant_user_id=data["applicant_user_id"], employee_kind=data["employee_kind"],
-                    department=data["department"], request_type="offline",
-                    category=category, start_date=start, end_date=end,
-                    requested_days=total, requested_days_by_year=days_by_year,
-                    purpose=data["purpose"], status="approved",
-                    final_decision="approved", final_decided_at=timezone.now(),
-                    final_decision_note="Recorded from prior offline sanction; no second approval workflow.",
+                    applicant_user_id=data["applicant_user_id"],
+                    employee_kind=data["employee_kind"],
+                    department=data["department"],
+                    request_type="offline",
+                    category=category,
+                    start_date=start,
+                    end_date=end,
+                    requested_days=total,
+                    requested_days_by_year=days_by_year,
+                    purpose=data["purpose"],
+                    status="approved",
+                    final_decision="approved",
+                    final_decided_at=timezone.now(),
+                    final_decision_note=(
+                        "Recorded from prior offline sanction; no second approval workflow."
+                    ),
                     evidence_reference=data["evidence_reference"],
                 )
         except IntegrityError as exc:
             if LeaveApplication.objects.filter(
-                request_type="offline", evidence_reference=data["evidence_reference"],
+                request_type="offline",
+                evidence_reference=data["evidence_reference"],
             ).exists():
-                raise ValidationError({"evidence_reference": "This offline sanction has already been recorded."}) from exc
+                raise ValidationError(
+                    {"evidence_reference": "This offline sanction has already been recorded."}
+                ) from exc
             raise
         post_application_balance(app, _actor(request).user_id)
-        _record(app, _actor(request).user_id, "offline_synchronized", "offline", "approved", app.evidence_reference)
+        _record(
+            app,
+            _actor(request).user_id,
+            "offline_synchronized",
+            "offline",
+            "approved",
+            app.evidence_reference,
+        )
         return Response(LeaveApplicationSerializer(app).data, status=status.HTTP_201_CREATED)
 
 
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="elm_leave_sla_config_retrieve",
+        request=None,
+        responses=OpenApiTypes.OBJECT,
+    ),
+    put=extend_schema(
+        operation_id="elm_leave_sla_config_update",
+        request=OpenApiTypes.OBJECT,
+        responses=OpenApiTypes.OBJECT,
+    ),
+)
 class LeaveSLAConfigView(APIView):
     permission_classes = [MODULE, HasPermission(P_MANAGE)]
 
     def get(self, request):
         config = LeaveSLAConfig.objects.order_by("id").first() or LeaveSLAConfig.objects.create()
-        return Response({"reminder_after_hours": config.reminder_after_hours,
-                         "escalation_after_hours": config.escalation_after_hours,
-                         "escalation_user_id": config.escalation_user_id})
+        return Response(
+            {
+                "reminder_after_hours": config.reminder_after_hours,
+                "escalation_after_hours": config.escalation_after_hours,
+                "escalation_user_id": config.escalation_user_id,
+            }
+        )
 
     def put(self, request):
         config = LeaveSLAConfig.objects.order_by("id").first() or LeaveSLAConfig.objects.create()
@@ -441,7 +793,14 @@ class LeaveSLAConfigView(APIView):
         except (TypeError, ValueError) as exc:
             raise ValidationError({"thresholds": "SLA thresholds must be integer hours."}) from exc
         if reminder < 1 or escalation <= reminder or reminder > 65535 or escalation > 65535:
-            raise ValidationError({"thresholds": "Use positive hour thresholds up to 65535, with escalation greater than reminder."})
+            raise ValidationError(
+                {
+                    "thresholds": (
+                        "Use positive hour thresholds up to 65535, "
+                        "with escalation greater than reminder."
+                    )
+                }
+            )
         raw_escalation_user = request.data.get("escalation_user_id")
         if raw_escalation_user in (None, ""):
             escalation_user = None
@@ -449,31 +808,68 @@ class LeaveSLAConfigView(APIView):
             if isinstance(raw_escalation_user, bool) or (
                 isinstance(raw_escalation_user, float) and not raw_escalation_user.is_integer()
             ):
-                raise ValidationError({"escalation_user_id": "Must be a whole positive integer or blank."})
+                raise ValidationError(
+                    {"escalation_user_id": "Must be a whole positive integer or blank."}
+                )
             try:
                 escalation_user = int(raw_escalation_user)
             except (TypeError, ValueError) as exc:
-                raise ValidationError({"escalation_user_id": "Must be a positive integer or blank."}) from exc
+                raise ValidationError(
+                    {"escalation_user_id": "Must be a positive integer or blank."}
+                ) from exc
             if escalation_user < 1 or escalation_user > 2147483647:
-                raise ValidationError({"escalation_user_id": "Must be a positive 32-bit integer or blank."})
+                raise ValidationError(
+                    {"escalation_user_id": "Must be a positive 32-bit integer or blank."}
+                )
         config.reminder_after_hours = reminder
         config.escalation_after_hours = escalation
         config.escalation_user_id = escalation_user
         config.save()
-        return Response({"reminder_after_hours": reminder, "escalation_after_hours": escalation,
-                         "escalation_user_id": config.escalation_user_id})
+        return Response(
+            {
+                "reminder_after_hours": reminder,
+                "escalation_after_hours": escalation,
+                "escalation_user_id": config.escalation_user_id,
+            }
+        )
 
 
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="elm_leave_notices_list",
+        request=None,
+        responses=OpenApiTypes.OBJECT,
+    )
+)
 class LeaveNoticesView(APIView):
     permission_classes = [MODULE]
 
     def get(self, request):
         rows = LeaveNotice.objects.filter(user_id=_actor(request).user_id)[:100]
-        return Response({"results": [{"id": r.id, "kind": r.kind, "message": r.message,
-                                      "application_id": r.application_id, "created_at": r.created_at,
-                                      "read_at": r.read_at} for r in rows]})
+        return Response(
+            {
+                "results": [
+                    {
+                        "id": r.id,
+                        "kind": r.kind,
+                        "message": r.message,
+                        "application_id": r.application_id,
+                        "created_at": r.created_at,
+                        "read_at": r.read_at,
+                    }
+                    for r in rows
+                ]
+            }
+        )
 
 
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="elm_leave_year_end_process",
+        request=OpenApiTypes.OBJECT,
+        responses=OpenApiTypes.OBJECT,
+    )
+)
 class LeaveYearEndView(APIView):
     permission_classes = [MODULE, HasPermission(P_MANAGE)]
 
@@ -488,10 +884,23 @@ class LeaveYearEndView(APIView):
         if year < 1900 or year > 9999:
             raise ValidationError({"year": "Must be between 1900 and 9999."})
         run = process_year_end(year, _actor(request).user_id)
-        return Response({"year": run.year, "processed_accounts": run.processed_accounts,
-                         "exceptions": run.exceptions}, status=status.HTTP_201_CREATED)
+        return Response(
+            {
+                "year": run.year,
+                "processed_accounts": run.processed_accounts,
+                "exceptions": run.exceptions,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="elm_leave_sla_process",
+        request=None,
+        responses=OpenApiTypes.OBJECT,
+    )
+)
 class ProcessSLAView(APIView):
     permission_classes = [MODULE, HasPermission(P_MANAGE)]
 

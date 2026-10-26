@@ -39,7 +39,9 @@ class LeaveRuleTests(SimpleTestCase):
 
     def test_restricted_holiday_counts_even_if_marked_closed(self):
         days = count_leave_days(
-            "RH", date(2026, 10, 12), date(2026, 10, 12),
+            "RH",
+            date(2026, 10, 12),
+            date(2026, 10, 12),
             closed_dates={date(2026, 10, 12)},
         )
         self.assertEqual(days, Decimal("1.00"))
@@ -47,8 +49,11 @@ class LeaveRuleTests(SimpleTestCase):
     def test_half_day_cl_is_not_counted_on_weekend_or_closure(self):
         weekend = count_leave_days("CL", date(2026, 10, 17), date(2026, 10, 17), cl_half="first")
         closed = count_leave_days(
-            "CL", date(2026, 10, 12), date(2026, 10, 12),
-            closed_dates={date(2026, 10, 12)}, cl_half="second",
+            "CL",
+            date(2026, 10, 12),
+            date(2026, 10, 12),
+            closed_dates={date(2026, 10, 12)},
+            cl_half="second",
         )
         self.assertEqual(weekend, Decimal("0.00"))
         self.assertEqual(closed, Decimal("0.00"))

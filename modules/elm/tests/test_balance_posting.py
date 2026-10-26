@@ -4,7 +4,7 @@ from decimal import Decimal
 from django.test import TestCase
 from rest_framework.exceptions import ValidationError
 
-from modules.elm.models import LeaveApplication, LeaveBalance, LeavePolicy, LeaveLedgerEntry
+from modules.elm.models import LeaveApplication, LeaveBalance, LeaveLedgerEntry, LeavePolicy
 from modules.elm.services import post_application_balance
 
 

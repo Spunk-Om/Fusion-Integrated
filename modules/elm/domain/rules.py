@@ -1,4 +1,5 @@
 """Pure-Python ELM policy helpers. Keep this layer independent of Django/DRF."""
+
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -7,12 +8,18 @@ from decimal import Decimal
 SUPPORTED_CATEGORIES = ("CL", "RH", "SCL", "EL", "COL", "VL")
 CONTINUOUS_CATEGORIES = frozenset({"EL", "COL", "VL"})
 NON_CARRY_FORWARD = frozenset({"CL", "RH", "SCL", "VL"})
-ACTIVE_REQUEST_STATUSES = frozenset({
-    "awaiting_substitute", "awaiting_unit_head", "awaiting_establishment",
-    "awaiting_sanction", "awaiting_cancellation_unit_head",
-    "awaiting_cancellation_sanction", "awaiting_resumption_review",
-    "action_required",
-})
+ACTIVE_REQUEST_STATUSES = frozenset(
+    {
+        "awaiting_substitute",
+        "awaiting_unit_head",
+        "awaiting_establishment",
+        "awaiting_sanction",
+        "awaiting_cancellation_unit_head",
+        "awaiting_cancellation_sanction",
+        "awaiting_resumption_review",
+        "action_required",
+    }
+)
 
 DEFAULT_ENTITLEMENTS = {
     "CL": Decimal("8.00"),
@@ -73,9 +80,7 @@ def count_leave_days(
         return Decimal("1.00")
 
     is_continuous = (
-        category in CONTINUOUS_CATEGORIES
-        if continuous_counting is None
-        else continuous_counting
+        category in CONTINUOUS_CATEGORIES if continuous_counting is None else continuous_counting
     )
     if is_continuous:
         return Decimal((end_date - start_date).days + 1)
